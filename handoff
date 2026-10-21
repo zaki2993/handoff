@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""handoff: move a coding session from one AI agent to another.
+
+Reads the last session of the old agent from disk, saves the raw facts
+(your messages, git changes, full transcript) in .handoff/, then starts
+the new agent and asks it to write the summary in .handoff/HANDOFF.md.
+
+Usage: handoff <claude|codex|opencode|agy> [--from AGENT] [--no-launch]
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from functools import partial
+from pathlib import Path
+
+HOME = Path.home()
+AGENTS = ["claude", "codex", "opencode", "agy"]
+ALIASES = {"antigravity": "agy", "claude-code": "claude"}
+MAX_OUT = 400  # chars of each tool call / tool output kept in the transcript
+
+PROMPT = """You are taking over a coding session from {old}, another AI agent that hit its usage limit. Do not lose anything important.
+
+1. Read {raw}. It has the user's messages word for word, the git changes, and the full transcript of the last session.
+2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches.
+3. Run `git diff` to see the real code changes.
+4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches.
+5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
+
+
+def short(s, n=MAX_OUT):
+    s = str(s).strip()
+    return s if len(s) <= n else s[:n] + f" ...[{len(s) - n} more chars]"
+
+
+def open_ro(path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+# Each agent has:
+#   <agent>_sessions(cwd) -> yields (updated_time, session_ref, loader)
+#   loader() -> list of (role, text), role is user / assistant / tool / result
+
+
+# ---------- Claude Code: ~/.claude/projects/<cwd with - >/<id>.jsonl ----------
+
+def claude_sessions(cwd):
+    folder = HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    for f in folder.glob("*.jsonl"):
+        yield f.stat().st_mtime, str(f), partial(claude_load, f)
+
+
+def claude_load(path):
+    msgs = []
+    for line in open(path, errors="replace"):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") not in ("user", "assistant") or e.get("isMeta") or e.get("isSidechain") \
+                or e.get("isApiErrorMessage"):
+            continue
+        content = e.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for c in content:
+            t = c.get("type")
+            if t == "text":
+                text = c.get("text", "")
+                if e["type"] == "user" and text.lstrip().startswith(("<command-", "<local-command")):
+                    continue
+                msgs.append((e["type"], text))
+            elif t == "tool_use":
+                msgs.append(("tool", f'{c.get("name")} {short(json.dumps(c.get("input")))}'))
+            elif t == "tool_result":
+                out = c.get("content") or ""
+                if isinstance(out, list):
+                    out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
+                msgs.append(("result", short(out)))
+    return msgs
+
+
+# ---------- Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl ----------
+
+def codex_sessions(cwd):
+    for f in (HOME / ".codex/sessions").rglob("rollout-*.jsonl"):
+        try:
+            with open(f) as fh:
+                meta = json.loads(fh.readline())
+        except (OSError, ValueError):
+            continue
+        if meta.get("payload", {}).get("cwd") == cwd:
+            yield f.stat().st_mtime, str(f), partial(codex_load, f)
+
+
+def codex_load(path):
+    msgs = []
+    for line in open(path, errors="replace"):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") != "response_item":
+            continue
+        p = e["payload"]
+        t = p.get("type")
+        if t == "message" and p.get("role") in ("user", "assistant"):
+            for c in p.get("content", []):
+                text = c.get("text", "")
+                # Codex adds its own context (environment, AGENTS.md) as user messages
+                if p["role"] == "user" and text.lstrip().startswith(("<", "# AGENTS.md instructions")):
+                    continue
+                if text:
+                    msgs.append((p["role"], text))
+        elif t in ("function_call", "custom_tool_call"):
+            msgs.append(("tool", f'{p.get("name")} {short(p.get("arguments") or p.get("input") or "")}'))
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            msgs.append(("result", short(p.get("output", ""))))
+    return msgs
+
+
+# ---------- OpenCode: ~/.local/share/opencode/*.db (SQLite) ----------
+
+OPENCODE_DBS = [HOME / ".local/share/opencode/opencode.db", HOME / ".local/share/opencode/opencode-local.db"]
+
+
+def opencode_sessions(cwd):
+    for db in OPENCODE_DBS:
+        if not db.exists():
+            continue
+        con = open_ro(db)
+        # newer versions use session_v2 + session_message, older use session + message + part
+        for table, loader in (("session_v2", opencode_load_v2), ("session", opencode_load_v1)):
+            try:
+                rows = con.execute(f"select id, time_updated from {table} where directory = ? and parent_id is null", (cwd,)).fetchall()
+            except sqlite3.Error:
+                continue
+            for sid, updated in rows:
+                yield updated / 1000, f"{db}:{sid}", partial(loader, db, sid)
+        con.close()
+
+
+def opencode_tool(name, state):
+    msgs = [("tool", f"{name} {short(json.dumps(state.get('input', {})))}")]
+    out = state.get("output") or state.get("error") or state.get("content") or ""
+    if isinstance(out, list):
+        out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
+    if out:
+        msgs.append(("result", short(out)))
+    return msgs
+
+
+def opencode_load_v2(db, sid):
+    msgs = []
+    con = open_ro(db)
+    for typ, data in con.execute("select type, data from session_message where session_id = ? order by seq", (sid,)):
+        d = json.loads(data)
+        if typ == "user" and d.get("text"):
+            msgs.append(("user", d["text"]))
+        elif typ == "assistant":
+            for c in d.get("content", []):
+                if c.get("type") == "text":
+                    msgs.append(("assistant", c.get("text", "")))
+                elif c.get("type") == "tool":
+                    msgs += opencode_tool(c.get("name"), c.get("state", {}))
+    con.close()
+    return msgs
+
+
+def opencode_load_v1(db, sid):
+    msgs = []
+    con = open_ro(db)
+    rows = con.execute(
+        "select json_extract(m.data, '$.role'), p.data from part p join message m on m.id = p.message_id "
+        "where p.session_id = ? order by p.time_created, p.id", (sid,))
+    for role, data in rows:
+        d = json.loads(data)
+        if d.get("type") == "text" and not d.get("synthetic"):
+            msgs.append((role, d.get("text", "")))
+        elif d.get("type") == "tool":
+            msgs += opencode_tool(d.get("tool"), d.get("state", {}))
+    con.close()
+    return msgs
+
+
+# ---------- Antigravity CLI: ~/.gemini/antigravity-cli (SQLite + protobuf) ----------
+
+AGY_DIR = HOME / ".gemini/antigravity-cli"
+
+
+def agy_sessions(cwd):
+    db = AGY_DIR / "conversation_summaries.db"
+    if not db.exists():
+        return
+    con = open_ro(db)
+    rows = con.execute("select conversation_id, last_modified_time, workspace_uris from conversation_summaries "
+                       "where parent_conversation_id = ''").fetchall()
+    con.close()
+    for cid, modified, workspaces in rows:
+        if "file://" + cwd not in [w.rstrip("/") for w in json.loads(workspaces or "[]")]:
+            continue
+        conv = AGY_DIR / "conversations" / f"{cid}.db"
+        if conv.exists():
+            # time looks like "2026-10-20 13:30:27.839397159+00:00"
+            updated = datetime.datetime.fromisoformat(modified[:19]).replace(tzinfo=datetime.timezone.utc).timestamp()
+            yield updated, cid, partial(agy_load, conv)
+
+
+def pb_varint(b, i):
+    result = shift = 0
+    while True:
+        c = b[i]
+        i += 1
+        result |= (c & 0x7F) << shift
+        shift += 7
+        if c < 0x80:
+            return result, i
+
+
+def pb_get(b, field):
+    """Return all values of one field in a protobuf message (no schema needed)."""
+    values, i = [], 0
+    while i < len(b):
+        key, i = pb_varint(b, i)
+        f, wire = key >> 3, key & 7
+        if wire == 0:
+            v, i = pb_varint(b, i)
+        elif wire == 1:
+            v, i = b[i:i + 8], i + 8
+        elif wire == 5:
+            v, i = b[i:i + 4], i + 4
+        elif wire == 2:
+            n, i = pb_varint(b, i)
+            v, i = b[i:i + n], i + n
+        else:
+            raise ValueError("unknown wire type")
+        if f == field:
+            values.append(v)
+    return values
+
+
+def agy_load(path):
+    # Found by looking at the data: step type 14 = user input (field 19.2),
+    # 15 = model reply (field 20: 1 = text, 7 = tool calls with 2 = name, 3 = args).
+    # Tool outputs are not decoded.
+    msgs = []
+    con = open_ro(path)
+    for step_type, payload in con.execute("select step_type, step_payload from steps order by idx"):
+        if not payload:
+            continue
+        try:
+            if step_type == 14:
+                for m in pb_get(payload, 19):
+                    msgs += [("user", t.decode(errors="replace")) for t in pb_get(m, 2)]
+            elif step_type == 15:
+                for m in pb_get(payload, 20):
+                    msgs += [("assistant", t.decode(errors="replace")) for t in pb_get(m, 1)]
+                    for call in pb_get(m, 7):
+                        name = b"".join(pb_get(call, 2)).decode(errors="replace")
+                        args = b"".join(pb_get(call, 3)).decode(errors="replace")
+                        msgs.append(("tool", f"{name} {short(args)}"))
+        except (ValueError, IndexError):
+            continue
+    con.close()
+    return msgs
+
+
+SESSIONS = {"claude": claude_sessions, "codex": codex_sessions, "opencode": opencode_sessions, "agy": agy_sessions}
+LAUNCH = {
+    "claude": lambda p: ["claude", p],
+    "codex": lambda p: ["codex", p],
+    "opencode": lambda p: ["opencode", "--prompt", p],
+    "agy": lambda p: ["agy", "-i", p],
+}
+
+
+def find_session(cwd, agents):
+    """Newest session in cwd, from the given agents, that has at least one user message."""
+    found = []
+    for agent in agents:
+        try:
+            found += [(t, agent, ref, load) for t, ref, load in SESSIONS[agent](cwd)]
+        except (OSError, sqlite3.Error) as e:
+            print(f"warning: could not read {agent} sessions: {e}", file=sys.stderr)
+    for t, agent, ref, load in sorted(found, key=lambda x: x[0], reverse=True):
+        try:
+            msgs = load()
+        except (OSError, sqlite3.Error, ValueError) as e:
+            print(f"warning: could not read {ref}: {e}", file=sys.stderr)
+            continue
+        if any(role == "user" for role, _ in msgs):
+            return agent, ref, t, msgs
+    return None
+
+
+def git(cwd, *args):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    return r.stdout.rstrip() if r.returncode == 0 else None
+
+
+def write_raw(cwd, old, new, ref, msgs):
+    now = datetime.datetime.now()
+    folder = Path(cwd) / ".handoff"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}.md"
+
+    user_msgs = [text for role, text in msgs if role == "user"]
+    replies = [text for role, text in msgs if role == "assistant"]
+    out = [f"# Handoff: {old} -> {new}", "",
+           f"- Time: {now:%Y-%m-%d %H:%M}", f"- Project: {cwd}", f"- Old session: {ref}", "",
+           "## User messages (word for word)", ""]
+    for i, text in enumerate(user_msgs, 1):
+        out += [f"### {i}", text.strip(), ""]
+    out += [f"## Last reply from {old}", "", replies[-1].strip() if replies else "(none)", ""]
+
+    out += ["## Git", ""]
+    if git(cwd, "rev-parse", "--is-inside-work-tree") == "true":
+        for title, args in (("status", ["status", "--short"]), ("diff --stat", ["diff", "--stat", "HEAD"]),
+                            ("recent commits", ["log", "--oneline", "-10"])):
+            out += [f"### git {title}", "```", git(cwd, *args) or "(empty)", "```", ""]
+    else:
+        out += ["Not a git repo.", ""]
+
+    labels = {"user": "**User:**", "assistant": f"**{old}:**", "tool": "`tool`", "result": "> result:"}
+    out += ["## Full transcript", ""]
+    for role, text in msgs:
+        out += [f"{labels[role]} {text.strip()}", ""]
+
+    path.write_text("\n".join(out))
+    return path
+
+
+def ignore_in_git(cwd):
+    """Add .handoff/ to .git/info/exclude so transcripts are never committed (local only)."""
+    exclude = git(cwd, "rev-parse", "--git-path", "info/exclude")
+    if not exclude:
+        return
+    exclude = Path(cwd) / exclude
+    text = exclude.read_text() if exclude.exists() else ""
+    if ".handoff/" not in text.split("\n"):
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".handoff/\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Move your session to another AI agent.")
+    ap.add_argument("to", help="agent to switch to: " + ", ".join(AGENTS))
+    ap.add_argument("--from", dest="src", help="agent to take the session from (default: newest session here)")
+    ap.add_argument("--no-launch", action="store_true", help="only write the handoff file and print the prompt")
+    args = ap.parse_args()
+
+    new = ALIASES.get(args.to, args.to)
+    src = ALIASES.get(args.src, args.src)
+    for name in (new, src):
+        if name and name not in AGENTS:
+            sys.exit(f"unknown agent: {name} (use one of: {', '.join(AGENTS)})")
+
+    cwd = os.getcwd()
+    found = find_session(cwd, [src] if src else [a for a in AGENTS if a != new])
+    if not found:
+        sys.exit(f"no session found for {cwd}")
+    old, ref, updated, msgs = found
+    print(f"from: {old}  ({ref}, last active {datetime.datetime.fromtimestamp(updated):%Y-%m-%d %H:%M})")
+
+    raw = write_raw(cwd, old, new, ref, msgs)
+    ignore_in_git(cwd)
+    print(f"saved: {raw.relative_to(cwd)}")
+
+    prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd))
+    cmd = LAUNCH[new](prompt)
+    if args.no_launch:
+        print("\nprompt:\n" + prompt)
+        return
+    print(f"starting {new}...")
+    try:
+        os.execvp(cmd[0], cmd)
+    except FileNotFoundError:
+        sys.exit(f"{cmd[0]} is not installed or not in PATH")
+
+
+if __name__ == "__main__":
+    main()

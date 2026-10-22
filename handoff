@@ -5,27 +5,39 @@ Reads the last session of the old agent from disk, saves the raw facts
 (your messages, git changes, full transcript) in .handoff/, then starts
 the new agent and asks it to write the summary in .handoff/HANDOFF.md.
 
-Usage: handoff <claude|codex|opencode|agy> [--from AGENT] [--no-launch] [--go]
+Usage: handoff <claude|codex|opencode|agy|pi> [--from AGENT] [--no-launch] [--go]
+       handoff --clean
 """
 import argparse
 import datetime
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import urllib.parse
+from collections import namedtuple
 from functools import partial
 from pathlib import Path
+
+# ---------- settings ----------
 
 HOME = Path.home()
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
-AGENTS = ["claude", "codex", "opencode", "agy"]
+OPENCODE_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "opencode"
+AGY_DIR = HOME / ".gemini/antigravity-cli"
+PI_SESSIONS = Path(os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+                   or Path(os.environ.get("PI_CODING_AGENT_DIR") or HOME / ".pi/agent") / "sessions")
+
 ALIASES = {"antigravity": "agy", "claude-code": "claude"}
 MAX_OUT = 2000  # chars of each tool call / tool output kept in the transcript
 MAX_DIFF = 200_000  # chars of git diff kept in the handoff file
+FOLDER = ".handoff"
+
+# ---------- prompt for the new agent ----------
 
 PROMPT = """You are taking over a coding session from {old}, another AI agent that hit its usage limit. Do not lose anything important.
 
@@ -45,6 +57,8 @@ When the user types go, do the steps below.
 
 """
 
+# ---------- helpers ----------
+
 
 def short(s, n=MAX_OUT):
     """Keep the start and the end (errors are often at the end)."""
@@ -58,12 +72,39 @@ def open_ro(path):
     return sqlite3.connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", uri=True)
 
 
+def read_jsonl(path):
+    """Yield each JSON object of a .jsonl file, skipping broken lines."""
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                yield e
+
+
+def first_json(path):
+    """The first line of a .jsonl file (where the session info is), or {}."""
+    with open(path, errors="replace") as fh:
+        e = json.loads(fh.readline() or "null")
+    return e if isinstance(e, dict) else {}
+
+
+def parts_text(parts):
+    """Join the text of a list of parts like [{"type": "text", "text": ...}]."""
+    if isinstance(parts, list):
+        return " ".join(x.get("text", "") for x in parts if isinstance(x, dict))
+    return parts
+
+
+# ---------- readers, one per agent ----------
 # Each agent has:
 #   <agent>_sessions(cwd) -> yields (updated_time, session_ref, loader)
 #   loader() -> list of (role, text), role is user / assistant / tool / result
 
 
-# ---------- Claude Code: ~/.claude/projects/<cwd with - >/<id>.jsonl ----------
+# Claude Code: ~/.claude/projects/<cwd with - >/<id>.jsonl
 
 def claude_sessions(cwd):
     folder = CLAUDE_HOME / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
@@ -77,25 +118,12 @@ def claude_sessions(cwd):
 
 
 def claude_cwd(path):
-    for line in open(path, errors="replace"):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(e, dict) and e.get("cwd"):
-            return e["cwd"]
-    return None
+    return next((e["cwd"] for e in read_jsonl(path) if e.get("cwd")), None)
 
 
 def claude_load(path):
     msgs = []
-    for line in open(path, errors="replace"):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict):
-            continue
+    for e in read_jsonl(path):
         if e.get("type") not in ("user", "assistant") or e.get("isMeta") or e.get("isSidechain") \
                 or e.get("isApiErrorMessage"):
             continue
@@ -112,14 +140,11 @@ def claude_load(path):
             elif t == "tool_use":
                 msgs.append(("tool", f'{c.get("name")} {short(json.dumps(c.get("input")))}'))
             elif t == "tool_result":
-                out = c.get("content") or ""
-                if isinstance(out, list):
-                    out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
-                msgs.append(("result", short(out)))
+                msgs.append(("result", short(parts_text(c.get("content") or ""))))
     return msgs
 
 
-# ---------- Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl ----------
+# Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
 
 CODEX_INJECTED = ("<environment_context", "<user_instructions", "<codex_internal_context", "<skill",
                   "<turn_aborted", "# AGENTS.md instructions")
@@ -128,9 +153,7 @@ CODEX_INJECTED = ("<environment_context", "<user_instructions", "<codex_internal
 def codex_sessions(cwd):
     for f in (CODEX_HOME / "sessions").rglob("rollout-*.jsonl"):
         try:
-            with open(f) as fh:
-                meta = json.loads(fh.readline())
-            if isinstance(meta, dict) and (meta.get("payload") or {}).get("cwd") == cwd:
+            if (first_json(f).get("payload") or {}).get("cwd") == cwd:
                 yield f.stat().st_mtime, str(f), partial(codex_load, f)
         except (OSError, ValueError, AttributeError):
             continue
@@ -138,12 +161,8 @@ def codex_sessions(cwd):
 
 def codex_load(path):
     msgs = []
-    for line in open(path, errors="replace"):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict) or e.get("type") != "response_item":
+    for e in read_jsonl(path):
+        if e.get("type") != "response_item":
             continue
         p = e["payload"]
         t = p.get("type")
@@ -233,10 +252,7 @@ def json_outputs(d):
     return []
 
 
-# ---------- OpenCode: ~/.local/share/opencode/opencode*.db (SQLite) ----------
-
-OPENCODE_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "opencode"
-
+# OpenCode: ~/.local/share/opencode/opencode*.db (SQLite)
 
 def opencode_dbs():
     # OPENCODE_DB (relative to the data folder) replaces the default ones,
@@ -268,8 +284,7 @@ def opencode_tool(name, state):
     out = state.get("output") or state.get("error") or state.get("content") or ""
     if isinstance(out, dict):  # errors look like {"type": "aborted", "message": "..."}
         out = out.get("message") or json.dumps(out)
-    if isinstance(out, list):
-        out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
+    out = parts_text(out)
     if out:
         msgs.append(("result", short(out)))
     return msgs
@@ -308,10 +323,7 @@ def opencode_load_v1(db, sid):
     return msgs
 
 
-# ---------- Antigravity CLI: ~/.gemini/antigravity-cli (SQLite + protobuf) ----------
-
-AGY_DIR = HOME / ".gemini/antigravity-cli"
-
+# Antigravity CLI: ~/.gemini/antigravity-cli (SQLite + protobuf)
 
 def agy_sessions(cwd):
     db = AGY_DIR / "conversation_summaries.db"
@@ -397,12 +409,65 @@ def agy_load(path):
     return msgs
 
 
-SESSIONS = {"claude": claude_sessions, "codex": codex_sessions, "opencode": opencode_sessions, "agy": agy_sessions}
-LAUNCH = {
-    "claude": lambda p: ["claude", p],
-    "codex": lambda p: ["codex", p],
-    "opencode": lambda p: ["opencode", "--prompt", p],
-    "agy": lambda p: ["agy", "-i", p],
+# pi: ~/.pi/agent/sessions/--<cwd with - >--/<time>_<id>.jsonl
+
+def pi_sessions(cwd):
+    for f in PI_SESSIONS.rglob("*.jsonl"):
+        try:
+            head = first_json(f)
+            if head.get("type") == "session" and head.get("cwd") == cwd:
+                yield f.stat().st_mtime, str(f), partial(pi_load, f)
+        except (OSError, ValueError):
+            continue
+
+
+def pi_load(path):
+    entries = [e for e in read_jsonl(path) if e.get("id")]
+    by_id = {e["id"]: e for e in entries}
+    # a session is a tree (you can go back and branch with /tree), so walk the
+    # current branch: from the last entry back to the start through parentId
+    branch, seen = [], set()
+    e = entries[-1] if entries else None
+    while e and e["id"] not in seen:
+        seen.add(e["id"])
+        branch.append(e)
+        e = by_id.get(e.get("parentId"))
+
+    msgs = []
+    for e in reversed(branch):
+        if e.get("type") == "branch_summary":
+            msgs.append(("assistant", "(summary of a branch the user left) " + str(e.get("summary", ""))))
+        if e.get("type") != "message":
+            continue
+        m = e.get("message") or {}
+        role, content = m.get("role"), m.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if role in ("user", "assistant"):
+            for c in content or []:
+                if c.get("type") == "text" and c.get("text"):
+                    msgs.append((role, c["text"]))
+                elif c.get("type") == "toolCall":
+                    msgs.append(("tool", f'{c.get("name")} {short(json.dumps(c.get("arguments")))}'))
+        elif role == "toolResult":
+            out = parts_text(content)
+            if out:
+                msgs.append(("result", short(("(error) " if m.get("isError") else "") + out)))
+        elif role == "bashExecution":  # a command the user ran with !
+            msgs.append(("tool", f"bash (run by the user) {short(m.get('command', ''))}"))
+            msgs.append(("result", short(m.get("output", ""))))
+    return msgs
+
+
+# ---------- all agents ----------
+
+Agent = namedtuple("Agent", "sessions launch")
+AGENTS = {
+    "claude": Agent(claude_sessions, lambda p: ["claude", p]),
+    "codex": Agent(codex_sessions, lambda p: ["codex", p]),
+    "opencode": Agent(opencode_sessions, lambda p: ["opencode", "--prompt", p]),
+    "agy": Agent(agy_sessions, lambda p: ["agy", "-i", p]),
+    "pi": Agent(pi_sessions, lambda p: ["pi", p]),
 }
 
 
@@ -411,7 +476,7 @@ def find_session(cwd, agents):
     found = []
     for agent in agents:
         try:
-            for t, ref, load in SESSIONS[agent](cwd):
+            for t, ref, load in AGENTS[agent].sessions(cwd):
                 found.append((t, agent, ref, load))  # keep what was found even if a later file fails
         except (OSError, sqlite3.Error, ValueError) as e:
             print(f"warning: could not read all {agent} sessions: {e}", file=sys.stderr)
@@ -426,6 +491,8 @@ def find_session(cwd, agents):
     return None
 
 
+# ---------- the handoff file ----------
+
 def git(cwd, *args):
     try:
         r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, errors="replace")
@@ -434,47 +501,57 @@ def git(cwd, *args):
     return r.stdout.rstrip() if r.returncode == 0 else None
 
 
+def is_git_repo(cwd):
+    return git(cwd, "rev-parse", "--is-inside-work-tree") == "true"
+
+
+def git_section(cwd):
+    if not is_git_repo(cwd):
+        return ["## Git", "", "Not a git repo.", ""]
+    if git(cwd, "rev-parse", "--verify", "-q", "HEAD"):
+        diffs = [["diff", "HEAD"]]
+    else:  # no commits yet, so there is no HEAD to compare with
+        diffs = [["diff", "--cached"], ["diff"]]
+    stat = "\n".join(filter(None, (git(cwd, *d, "--stat") for d in diffs))) or "(empty)"
+    diff = "\n".join(filter(None, (git(cwd, *d) for d in diffs))) or "(empty)"
+    if len(diff) > MAX_DIFF:
+        diff = diff[:MAX_DIFF] + f"\n...[{len(diff) - MAX_DIFF} chars cut, run git diff to see all]"
+    return ["## Git", "",
+            "### git status", "```", git(cwd, "status", "--short") or "(empty)", "```", "",
+            "### git diff --stat", "```", stat, "```", "",
+            "### recent commits", "```", git(cwd, "log", "--oneline", "-10") or "(none)", "```", "",
+            "### git diff (staged + unstaged)", "```diff", diff, "```", ""]
+
+
 def write_raw(cwd, old, new, ref, msgs):
     now = datetime.datetime.now()
     user_msgs = [text for role, text in msgs if role == "user"]
     replies = [text for role, text in msgs if role == "assistant"]
+
     out = [f"# Handoff: {old} -> {new}", "",
            f"- Time: {now:%Y-%m-%d %H:%M}", f"- Project: {cwd}", f"- Old session: {ref}", "",
            "## User messages (word for word)", ""]
     for i, text in enumerate(user_msgs, 1):
         out += [f"### {i}", text.strip("\r\n"), ""]
     out += [f"## Last reply from {old}", "", replies[-1].strip() if replies else "(none)", ""]
-
-    out += ["## Git", ""]
-    if git(cwd, "rev-parse", "--is-inside-work-tree") == "true":
-        if git(cwd, "rev-parse", "--verify", "-q", "HEAD"):
-            diffs = [["diff", "HEAD"]]
-        else:  # no commits yet, so there is no HEAD to compare with
-            diffs = [["diff", "--cached"], ["diff"]]
-        stat = "\n".join(filter(None, (git(cwd, *d, "--stat") for d in diffs))) or "(empty)"
-        diff = "\n".join(filter(None, (git(cwd, *d) for d in diffs))) or "(empty)"
-        if len(diff) > MAX_DIFF:
-            diff = diff[:MAX_DIFF] + f"\n...[{len(diff) - MAX_DIFF} chars cut, run git diff to see all]"
-        out += ["### git status", "```", git(cwd, "status", "--short") or "(empty)", "```", "",
-                "### git diff --stat", "```", stat, "```", "",
-                "### recent commits", "```", git(cwd, "log", "--oneline", "-10") or "(none)", "```", "",
-                "### git diff (staged + unstaged)", "```diff", diff, "```", ""]
-    else:
-        out += ["Not a git repo.", ""]
-
+    out += git_section(cwd)
     labels = {"user": "**User:**", "assistant": f"**{old}:**", "tool": "`tool`", "result": "> result:"}
     out += ["## Full transcript", ""]
     for role, text in msgs:
         out += [labels[role] + " " + text.strip("\r\n"), ""]
 
-    folder = Path(cwd) / ".handoff"
+    return save_new_file(Path(cwd) / FOLDER, f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}", "\n".join(out))
+
+
+def save_new_file(folder, name, text):
+    """Save as <name>.md, or <name>-2.md, ... if it exists, so two runs never overwrite."""
     folder.mkdir(exist_ok=True)
     n = 1
     while True:
-        path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}{'' if n == 1 else f'-{n}'}.md"
+        path = folder / f"{name}{'' if n == 1 else f'-{n}'}.md"
         try:
-            with open(path, "x") as fh:  # "x" fails if the file exists, so two runs never overwrite
-                fh.write("\n".join(out))
+            with open(path, "x") as fh:  # "x" fails if the file exists
+                fh.write(text)
             return path
         except FileExistsError:
             n += 1
@@ -492,21 +569,28 @@ def ignore_in_git(cwd):
         exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".handoff/\n")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Move your session to another AI agent.")
-    ap.add_argument("to", help="agent to switch to: " + ", ".join(AGENTS))
-    ap.add_argument("--from", dest="src", help="agent to take the session from (default: newest session here)")
-    ap.add_argument("--no-launch", action="store_true", help="only write the handoff file and print the prompt")
-    ap.add_argument("--go", action="store_true", help="start working right away (skip the wait to pick a model)")
-    args = ap.parse_args()
+# ---------- commands ----------
 
-    new = ALIASES.get(args.to, args.to)
-    src = ALIASES.get(args.src, args.src)
-    for name in (new, src):
-        if name and name not in AGENTS:
-            sys.exit(f"unknown agent: {name} (use one of: {', '.join(AGENTS)})")
+def clean(cwd):
+    """Delete .handoff/ after the user types y."""
+    folder = Path(cwd) / FOLDER
+    if not folder.is_dir():
+        print(f"nothing to clean: no {FOLDER}/ folder here")
+        return
+    files = [f for f in folder.rglob("*") if f.is_file()]
+    print(f"This deletes {folder} ({len(files)} files): all saved chats and HANDOFF.md.")
+    try:
+        answer = input("Delete it? [y/N] ")
+    except EOFError:  # no keyboard input (e.g. piped), so don't delete
+        answer = ""
+    if answer.strip().lower() in ("y", "yes"):
+        shutil.rmtree(folder)
+        print(f"deleted {FOLDER}/")
+    else:
+        print("cancelled, nothing deleted")
 
-    cwd = os.getcwd()
+
+def handoff(cwd, new, src, go, launch):
     found = find_session(cwd, [src] if src else [a for a in AGENTS if a != new])
     if not found:
         sys.exit(f"no session found for {cwd}")
@@ -517,20 +601,43 @@ def main():
     ignore_in_git(cwd)
     print(f"saved: {raw.relative_to(cwd)}")
 
-    is_git = git(cwd, "rev-parse", "--is-inside-work-tree") == "true"
-    prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd), git_step=GIT_STEP if is_git else NO_GIT_STEP)
-    if not args.go:
+    prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd), git_step=GIT_STEP if is_git_repo(cwd) else NO_GIT_STEP)
+    if not go:
         prompt = WAIT + prompt
-    cmd = LAUNCH[new](prompt)
-    if args.no_launch:
+    if not launch:
         print("\nprompt:\n" + prompt)
         return
+    cmd = AGENTS[new].launch(prompt)
     print(f"starting {new}...")
     sys.stdout.flush()  # exec replaces this process, unflushed output would be lost
     try:
         os.execvp(cmd[0], cmd)
     except FileNotFoundError:
         sys.exit(f"{cmd[0]} is not installed or not in PATH")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Move your session to another AI agent.")
+    ap.add_argument("to", nargs="?", help="agent to switch to: " + ", ".join(AGENTS))
+    ap.add_argument("--from", dest="src", help="agent to take the session from (default: newest session here)")
+    ap.add_argument("--no-launch", action="store_true", help="only write the handoff file and print the prompt")
+    ap.add_argument("--go", action="store_true", help="start working right away (skip the wait to pick a model)")
+    ap.add_argument("--clean", action="store_true", help=f"delete the {FOLDER}/ folder here (asks first)")
+    args = ap.parse_args()
+
+    if args.clean:
+        if args.to:
+            ap.error("--clean does not take an agent")
+        return clean(os.getcwd())
+    if not args.to:
+        ap.error("choose the agent to switch to: " + ", ".join(AGENTS))
+
+    new = ALIASES.get(args.to, args.to)
+    src = ALIASES.get(args.src, args.src)
+    for name in (new, src):
+        if name and name not in AGENTS:
+            sys.exit(f"unknown agent: {name} (use one of: {', '.join(AGENTS)})")
+    handoff(os.getcwd(), new, src, args.go, not args.no_launch)
 
 
 if __name__ == "__main__":

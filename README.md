@@ -7,6 +7,7 @@ Works on Linux with:
 - Codex (`codex`)
 - OpenCode (`opencode`)
 - Antigravity CLI (`agy`)
+- pi (`pi`)
 
 ## Install
 
@@ -35,7 +36,7 @@ Run it from your project folder (the same folder where you started the old agent
 handoff codex
 ```
 
-Change `codex` to the agent you want to switch to: `claude`, `codex`, `opencode` or `agy`.
+Change `codex` to the agent you want to switch to: `claude`, `codex`, `opencode`, `agy` or `pi`.
 
 The new agent waits so you can pick a model with `/model`. Type `go` to start. Use `handoff codex --go` to skip the wait.
 
@@ -86,9 +87,11 @@ Your exact messages are saved as-is, so rules like "don't touch the database cod
 | `--from claude` | Pick the old agent yourself (default: the newest session in this folder) |
 | `--go` | Start working right away, skip the wait to pick a model |
 | `--no-launch` | Only save the file and print the prompt, don't start the new agent |
+| `--clean` | Delete the `.handoff/` folder in this project (asks you to type `y` first) |
 
 ## Notes
 
 - `.handoff/` is added to `.git/info/exclude`, so your chats are never committed.
+- Old files in `.handoff/` are never deleted for you. Run `handoff --clean` when you don't need them anymore.
 - Long tool outputs are cut in the middle (the start and the end are kept, since errors are usually at the end).
-- Respects `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME` and `OPENCODE_DB` if you set them.
+- Respects `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, `OPENCODE_DB`, `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` if you set them.

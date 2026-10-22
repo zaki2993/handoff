@@ -59,7 +59,7 @@ Codex hits its limit too? Run `handoff opencode`. OpenCode gets the work from bo
 2. Saves a file in `.handoff/` with:
    - your messages, word for word
    - the old agent's last reply
-   - `git status` and `git diff --stat`
+   - `git status` and the full `git diff HEAD` (staged + unstaged changes)
    - the full chat
 3. Starts the new agent and asks it to read that file, write a summary in `.handoff/HANDOFF.md`, and continue.
 
@@ -75,4 +75,5 @@ Your exact messages are saved as-is, so rules like "don't touch the database cod
 ## Notes
 
 - `.handoff/` is added to `.git/info/exclude`, so your chats are never committed.
-- For Antigravity, tool outputs are not saved (only your messages, its replies and the tools it called).
+- Long tool outputs are cut in the middle (the start and the end are kept, since errors are usually at the end).
+- Respects `CODEX_HOME` and `CLAUDE_CONFIG_DIR` if you set them.

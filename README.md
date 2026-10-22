@@ -15,8 +15,11 @@ You need Python 3 and git. No other dependencies.
 ```
 git clone https://github.com/zaki2993/handoff.git ~/handoff
 chmod +x ~/handoff/handoff
+mkdir -p ~/.local/bin
 ln -s ~/handoff/handoff ~/.local/bin/handoff
 ```
+
+If `handoff` is not found after this, add `~/.local/bin` to your PATH (most distros already do).
 
 Check it works:
 
@@ -33,6 +36,8 @@ handoff codex
 ```
 
 Change `codex` to the agent you want to switch to: `claude`, `codex`, `opencode` or `agy`.
+
+The new agent waits so you can pick a model with `/model`. Type `go` to start. Use `handoff codex --go` to skip the wait.
 
 ## Example
 

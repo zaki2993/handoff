@@ -121,9 +121,20 @@ def claude_cwd(path):
     return next((e["cwd"] for e in read_jsonl(path) if e.get("cwd")), None)
 
 
+CLAUDE_NOT_TYPED = ("<task-notification", "<agent-message")  # background task and sub-agent results
+
+
 def claude_load(path):
     msgs = []
     for e in read_jsonl(path):
+        if e.get("type") == "attachment":
+            # a message you type while Claude is busy can be fed into the running turn, saved like this
+            a = e.get("attachment")
+            if isinstance(a, dict) and a.get("type") == "queued_command" and not e.get("isSidechain"):
+                text = parts_text(a.get("prompt") or "")
+                if isinstance(text, str) and text.strip() and not text.lstrip().startswith(CLAUDE_NOT_TYPED):
+                    msgs.append(("user", text))
+            continue
         if e.get("type") not in ("user", "assistant") or e.get("isMeta") or e.get("isSidechain") \
                 or e.get("isApiErrorMessage"):
             continue
@@ -162,6 +173,11 @@ def codex_sessions(cwd):
 def codex_load(path):
     msgs = []
     for e in read_jsonl(path):
+        p = e.get("payload")
+        if e.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") == "turn_aborted" \
+                and p.get("reason") == "interrupted":
+            msgs.append(("user", "[Request interrupted by user]"))  # you pressed Esc; same mark Claude uses
+            continue
         if e.get("type") != "response_item":
             continue
         p = e["payload"]

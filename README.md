@@ -30,17 +30,20 @@ handoff --help
 
 ## Use
 
-Run it from your project folder (the same folder where you started the old agent):
+When your agent hits its limit:
 
-```
-handoff codex
-```
+1. Open a terminal in your project folder (the same folder you were working in with the old agent).
+2. Run `handoff` with the name of the agent you want to move to:
+   ```
+   handoff codex
+   ```
+   You can use `claude`, `codex`, `opencode`, `agy` or `pi`. You don't need to say which agent you're coming from, handoff finds it.
+3. The new agent opens and waits. If you want a different model, pick it with `/model`.
+4. Type `go`. The agent reads what the old one did and continues the work.
 
-Change `codex` to the agent you want to switch to: `claude`, `codex`, `opencode`, `agy` or `pi`.
+To skip the wait and start right away: `handoff codex --go`
 
-The new agent waits so you can pick a model with `/model`. Type `go` to start. Use `handoff codex --go` to skip the wait.
-
-**Tip: use it in a git repo.** Git shows exactly what changed on disk, even changes made by scripts or by you. Without git, the new agent only has the chat transcript to go on. If your project has no git yet, run `git init` in it.
+**Tip: work in a git repo.** Git records every file change, even the ones you or a script made, so the new agent sees exactly what changed. Without git, it only has the old chat to go on. No git yet? Run `git init` in your project folder.
 
 ## Example
 

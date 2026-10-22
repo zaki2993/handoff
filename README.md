@@ -39,6 +39,8 @@ Change `codex` to the agent you want to switch to: `claude`, `codex`, `opencode`
 
 The new agent waits so you can pick a model with `/model`. Type `go` to start. Use `handoff codex --go` to skip the wait.
 
+**Tip: use it in a git repo.** Git shows exactly what changed on disk, even changes made by scripts or by you. Without git, the new agent only has the chat transcript to go on. If your project has no git yet, run `git init` in it.
+
 ## Example
 
 You're working in Claude Code and hit the limit:

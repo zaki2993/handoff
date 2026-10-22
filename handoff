@@ -29,11 +29,14 @@ MAX_DIFF = 200_000  # chars of git diff kept in the handoff file
 
 PROMPT = """You are taking over a coding session from {old}, another AI agent that hit its usage limit. Do not lose anything important.
 
-1. Read {raw}. It has the user's messages word for word, the git changes, and the full transcript of the last session.
+1. Read {raw}. It has the user's messages word for word, the git changes (if any), and the full transcript of the last session.
 2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches.
-3. Run `git status` and `git diff HEAD` to see the real code changes (if there are no commits yet: `git diff --cached` and `git diff`).
-4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches.
+3. {git_step}
+4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches. If important files are in /tmp, say so in Key files, since /tmp is deleted on reboot.
 5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
+
+GIT_STEP = "Run `git status` and `git diff HEAD` to see the real code changes (if there are no commits yet: `git diff --cached` and `git diff`)."
+NO_GIT_STEP = "This folder is not a git repo, so use the transcript to see which files were changed."
 
 # Added in front of PROMPT (unless --go) so the user can pick a model with /model first.
 WAIT = """Do not start yet and do not read any files. Reply with exactly this one line and nothing else:
@@ -436,7 +439,8 @@ def main():
     ignore_in_git(cwd)
     print(f"saved: {raw.relative_to(cwd)}")
 
-    prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd))
+    is_git = git(cwd, "rev-parse", "--is-inside-work-tree") == "true"
+    prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd), git_step=GIT_STEP if is_git else NO_GIT_STEP)
     if not args.go:
         prompt = WAIT + prompt
     cmd = LAUNCH[new](prompt)

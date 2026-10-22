@@ -5,7 +5,7 @@ Reads the last session of the old agent from disk, saves the raw facts
 (your messages, git changes, full transcript) in .handoff/, then starts
 the new agent and asks it to write the summary in .handoff/HANDOFF.md.
 
-Usage: handoff <claude|codex|opencode|agy> [--from AGENT] [--no-launch]
+Usage: handoff <claude|codex|opencode|agy> [--from AGENT] [--no-launch] [--go]
 """
 import argparse
 import datetime
@@ -34,6 +34,13 @@ PROMPT = """You are taking over a coding session from {old}, another AI agent th
 3. Run `git status` and `git diff HEAD` to see the real code changes.
 4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches.
 5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
+
+# Added in front of PROMPT (unless --go) so the user can pick a model with /model first.
+WAIT = """Do not start yet and do not read any files. Reply with exactly this one line and nothing else:
+"Ready. Pick a model with /model if you want, then type go."
+When the user types go, do the steps below.
+
+"""
 
 
 def short(s, n=MAX_OUT):
@@ -390,6 +397,7 @@ def main():
     ap.add_argument("to", help="agent to switch to: " + ", ".join(AGENTS))
     ap.add_argument("--from", dest="src", help="agent to take the session from (default: newest session here)")
     ap.add_argument("--no-launch", action="store_true", help="only write the handoff file and print the prompt")
+    ap.add_argument("--go", action="store_true", help="start working right away (skip the wait to pick a model)")
     args = ap.parse_args()
 
     new = ALIASES.get(args.to, args.to)
@@ -410,6 +418,8 @@ def main():
     print(f"saved: {raw.relative_to(cwd)}")
 
     prompt = PROMPT.format(old=old, raw=raw.relative_to(cwd))
+    if not args.go:
+        prompt = WAIT + prompt
     cmd = LAUNCH[new](prompt)
     if args.no_launch:
         print("\nprompt:\n" + prompt)

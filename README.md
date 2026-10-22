@@ -49,7 +49,13 @@ saved: .handoff/2026-10-22_14-31-05_claude-to-codex.md
 starting codex...
 ```
 
-Codex opens, reads what Claude did, writes a summary in `.handoff/HANDOFF.md` and continues the task.
+Codex opens and replies:
+
+```
+Ready. Pick a model with /model if you want, then type go.
+```
+
+Pick a model from the `/model` menu (or skip it), then type `go`. Codex reads what Claude did, writes a summary in `.handoff/HANDOFF.md` and continues the task.
 
 Codex hits its limit too? Run `handoff opencode`. OpenCode gets the work from both Claude and Codex.
 
@@ -61,7 +67,8 @@ Codex hits its limit too? Run `handoff opencode`. OpenCode gets the work from bo
    - the old agent's last reply
    - `git status` and the full `git diff HEAD` (staged + unstaged changes)
    - the full chat
-3. Starts the new agent and asks it to read that file, write a summary in `.handoff/HANDOFF.md`, and continue.
+3. Starts the new agent, which waits for you to pick a model and type `go`.
+4. The agent reads that file, writes a summary in `.handoff/HANDOFF.md`, and continues.
 
 Your exact messages are saved as-is, so rules like "don't touch the database code" are never lost, even if the summary misses them.
 
@@ -70,6 +77,7 @@ Your exact messages are saved as-is, so rules like "don't touch the database cod
 | Option | What it does |
 |---|---|
 | `--from claude` | Pick the old agent yourself (default: the newest session in this folder) |
+| `--go` | Start working right away, skip the wait to pick a model |
 | `--no-launch` | Only save the file and print the prompt, don't start the new agent |
 
 ## Notes

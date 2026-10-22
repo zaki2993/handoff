@@ -89,4 +89,4 @@ Your exact messages are saved as-is, so rules like "don't touch the database cod
 
 - `.handoff/` is added to `.git/info/exclude`, so your chats are never committed.
 - Long tool outputs are cut in the middle (the start and the end are kept, since errors are usually at the end).
-- Respects `CODEX_HOME` and `CLAUDE_CONFIG_DIR` if you set them.
+- Respects `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME` and `OPENCODE_DB` if you set them.

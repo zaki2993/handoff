@@ -31,7 +31,7 @@ PROMPT = """You are taking over a coding session from {old}, another AI agent th
 
 1. Read {raw}. It has the user's messages word for word, the git changes, and the full transcript of the last session.
 2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches.
-3. Run `git status` and `git diff HEAD` to see the real code changes.
+3. Run `git status` and `git diff HEAD` to see the real code changes (if there are no commits yet: `git diff --cached` and `git diff`).
 4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches.
 5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
 
@@ -65,9 +65,12 @@ def open_ro(path):
 def claude_sessions(cwd):
     folder = CLAUDE_HOME / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
     for f in folder.glob("*.jsonl"):
-        # different paths can share a folder (my-app and my_app), so check the real cwd
-        if claude_cwd(f) == cwd:
-            yield f.stat().st_mtime, str(f), partial(claude_load, f)
+        try:
+            # different paths can share a folder (my-app and my_app), so check the real cwd
+            if claude_cwd(f) == cwd:
+                yield f.stat().st_mtime, str(f), partial(claude_load, f)
+        except OSError:
+            continue
 
 
 def claude_cwd(path):
@@ -87,6 +90,8 @@ def claude_load(path):
         try:
             e = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(e, dict):
             continue
         if e.get("type") not in ("user", "assistant") or e.get("isMeta") or e.get("isSidechain") \
                 or e.get("isApiErrorMessage"):
@@ -122,10 +127,10 @@ def codex_sessions(cwd):
         try:
             with open(f) as fh:
                 meta = json.loads(fh.readline())
-        except (OSError, ValueError):
+            if isinstance(meta, dict) and (meta.get("payload") or {}).get("cwd") == cwd:
+                yield f.stat().st_mtime, str(f), partial(codex_load, f)
+        except (OSError, ValueError, AttributeError):
             continue
-        if meta.get("payload", {}).get("cwd") == cwd:
-            yield f.stat().st_mtime, str(f), partial(codex_load, f)
 
 
 def codex_load(path):
@@ -135,7 +140,7 @@ def codex_load(path):
             e = json.loads(line)
         except ValueError:
             continue
-        if e.get("type") != "response_item":
+        if not isinstance(e, dict) or e.get("type") != "response_item":
             continue
         p = e["payload"]
         t = p.get("type")
@@ -154,25 +159,32 @@ def codex_load(path):
     return msgs
 
 
-# ---------- OpenCode: ~/.local/share/opencode/*.db (SQLite) ----------
+# ---------- OpenCode: ~/.local/share/opencode/opencode*.db (SQLite) ----------
 
-OPENCODE_DBS = [HOME / ".local/share/opencode/opencode.db", HOME / ".local/share/opencode/opencode-local.db"]
+OPENCODE_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "opencode"
+
+
+def opencode_dbs():
+    # opencode.db, plus opencode-<channel>.db, plus OPENCODE_DB (relative to the data folder)
+    dbs = sorted(OPENCODE_DATA.glob("opencode*.db"))
+    custom = os.environ.get("OPENCODE_DB")
+    if custom and custom != ":memory:":
+        dbs.append(OPENCODE_DATA / custom)
+    return [db for db in dict.fromkeys(dbs) if db.exists()]
 
 
 def opencode_sessions(cwd):
-    for db in OPENCODE_DBS:
-        if not db.exists():
-            continue
-        con = open_ro(db)
+    for db in opencode_dbs():
         # newer versions use session_v2 + session_message, older use session + message + part
         for table, loader in (("session_v2", opencode_load_v2), ("session", opencode_load_v1)):
             try:
+                con = open_ro(db)
                 rows = con.execute(f"select id, time_updated from {table} where directory = ? and parent_id is null", (cwd,)).fetchall()
+                con.close()
             except sqlite3.Error:
                 continue
             for sid, updated in rows:
                 yield updated / 1000, f"{db}:{sid}", partial(loader, db, sid)
-        con.close()
 
 
 def opencode_tool(name, state):
@@ -235,8 +247,8 @@ def agy_sessions(cwd):
         try:
             paths = [urllib.parse.unquote(urllib.parse.urlparse(w).path).rstrip("/")
                      for w in json.loads(workspaces or "[]")]
-            # time looks like "2026-10-20 13:30:27.839397159+00:00"
-            updated = datetime.datetime.fromisoformat(modified[:19]).replace(tzinfo=datetime.timezone.utc).timestamp()
+            # time looks like "2026-10-20 13:30:27.839397159+00:00", Python reads at most 6 digits of fraction
+            updated = datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", modified)).timestamp()
         except (ValueError, TypeError, AttributeError):
             continue  # skip one broken row, keep looking at the others
         conv = AGY_DIR / "conversations" / f"{cid}.db"
@@ -321,13 +333,14 @@ def find_session(cwd, agents):
     found = []
     for agent in agents:
         try:
-            found += [(t, agent, ref, load) for t, ref, load in SESSIONS[agent](cwd)]
+            for t, ref, load in SESSIONS[agent](cwd):
+                found.append((t, agent, ref, load))  # keep what was found even if a later file fails
         except (OSError, sqlite3.Error, ValueError) as e:
-            print(f"warning: could not read {agent} sessions: {e}", file=sys.stderr)
+            print(f"warning: could not read all {agent} sessions: {e}", file=sys.stderr)
     for t, agent, ref, load in sorted(found, key=lambda x: x[0], reverse=True):
         try:
             msgs = load()
-        except (OSError, sqlite3.Error, ValueError) as e:
+        except (OSError, sqlite3.Error, ValueError, AttributeError, TypeError, KeyError) as e:
             print(f"warning: could not read {ref}: {e}", file=sys.stderr)
             continue
         if any(role == "user" for role, _ in msgs):
@@ -342,14 +355,6 @@ def git(cwd, *args):
 
 def write_raw(cwd, old, new, ref, msgs):
     now = datetime.datetime.now()
-    folder = Path(cwd) / ".handoff"
-    folder.mkdir(exist_ok=True)
-    path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}.md"
-    n = 2
-    while path.exists():
-        path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}-{n}.md"
-        n += 1
-
     user_msgs = [text for role, text in msgs if role == "user"]
     replies = [text for role, text in msgs if role == "assistant"]
     out = [f"# Handoff: {old} -> {new}", "",
@@ -361,13 +366,18 @@ def write_raw(cwd, old, new, ref, msgs):
 
     out += ["## Git", ""]
     if git(cwd, "rev-parse", "--is-inside-work-tree") == "true":
-        for title, args in (("status", ["status", "--short"]), ("diff --stat", ["diff", "--stat", "HEAD"]),
-                            ("recent commits", ["log", "--oneline", "-10"])):
-            out += [f"### git {title}", "```", git(cwd, *args) or "(empty)", "```", ""]
-        diff = git(cwd, "diff", "HEAD") or "(empty)"
+        if git(cwd, "rev-parse", "--verify", "-q", "HEAD"):
+            diffs = [["diff", "HEAD"]]
+        else:  # no commits yet, so there is no HEAD to compare with
+            diffs = [["diff", "--cached"], ["diff"]]
+        stat = "\n".join(filter(None, (git(cwd, *d, "--stat") for d in diffs))) or "(empty)"
+        diff = "\n".join(filter(None, (git(cwd, *d) for d in diffs))) or "(empty)"
         if len(diff) > MAX_DIFF:
-            diff = diff[:MAX_DIFF] + f"\n...[{len(diff) - MAX_DIFF} chars cut, run `git diff HEAD` to see all]"
-        out += ["### git diff HEAD (staged + unstaged)", "```diff", diff, "```", ""]
+            diff = diff[:MAX_DIFF] + f"\n...[{len(diff) - MAX_DIFF} chars cut, run git diff to see all]"
+        out += ["### git status", "```", git(cwd, "status", "--short") or "(empty)", "```", "",
+                "### git diff --stat", "```", stat, "```", "",
+                "### recent commits", "```", git(cwd, "log", "--oneline", "-10") or "(none)", "```", "",
+                "### git diff (staged + unstaged)", "```diff", diff, "```", ""]
     else:
         out += ["Not a git repo.", ""]
 
@@ -376,8 +386,17 @@ def write_raw(cwd, old, new, ref, msgs):
     for role, text in msgs:
         out += [f"{labels[role]} {text.strip()}", ""]
 
-    path.write_text("\n".join(out))
-    return path
+    folder = Path(cwd) / ".handoff"
+    folder.mkdir(exist_ok=True)
+    n = 1
+    while True:
+        path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{old}-to-{new}{'' if n == 1 else f'-{n}'}.md"
+        try:
+            with open(path, "x") as fh:  # "x" fails if the file exists, so two runs never overwrite
+                fh.write("\n".join(out))
+            return path
+        except FileExistsError:
+            n += 1
 
 
 def ignore_in_git(cwd):
@@ -425,6 +444,7 @@ def main():
         print("\nprompt:\n" + prompt)
         return
     print(f"starting {new}...")
+    sys.stdout.flush()  # exec replaces this process, unflushed output would be lost
     try:
         os.execvp(cmd[0], cmd)
     except FileNotFoundError:

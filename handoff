@@ -2,7 +2,7 @@
 """handoff: move a coding session from one AI agent to another.
 
 Reads the last session of the old agent from disk, saves the raw facts
-(your messages, git changes, full transcript) in .handoff/, then starts
+(your messages and the full transcript) in .handoff/, then starts
 the new agent and asks it to write the summary in .handoff/HANDOFF.md.
 
 Usage: handoff <claude|codex|opencode|agy|pi> [--from AGENT] [--no-launch] [--go]
@@ -34,20 +34,20 @@ PI_SESSIONS = Path(os.environ.get("PI_CODING_AGENT_SESSION_DIR")
 
 ALIASES = {"antigravity": "agy", "claude-code": "claude"}
 MAX_OUT = 2000  # chars of each tool call / tool output kept in the transcript
-MAX_DIFF = 200_000  # chars of git diff kept in the handoff file
 FOLDER = ".handoff"
 
 # ---------- prompt for the new agent ----------
 
 PROMPT = """You are taking over a coding session from {old}, another AI agent that hit its usage limit. Do not lose anything important.
 
-1. Read {raw}. It has the user's messages word for word, the git changes (if any), and the full transcript of the last session. If it is long, read the top and the end of the transcript first: the end shows where the work stopped.
+1. Read {raw}. It has the user's messages word for word and the full transcript of the last session. If it is long, read the top and the end of the transcript first: the end shows where the work stopped.
 2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches, but it may be about an older, different task. Keep only what still matters for the current task.
 3. {git_step}
 4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches. If important files are in /tmp, say so in Key files, since /tmp is deleted on reboot.
 5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
 
-GIT_STEP = "Run `git status` and `git diff HEAD` to see the real code changes (if there are no commits yet: `git diff --cached` and `git diff`)."
+GIT_STEP = ("Run `git status`, `git diff HEAD` and `git log --oneline -10` to see the real code changes and recent commits "
+            "(if there are no commits yet, use `git diff --cached` and `git diff` instead of `git diff HEAD`).")
 NO_GIT_STEP = "This folder is not a git repo, so use the transcript to see which files were changed."
 
 # Added in front of PROMPT (unless --go) so the user can pick a model with /model first.
@@ -505,24 +505,6 @@ def is_git_repo(cwd):
     return git(cwd, "rev-parse", "--is-inside-work-tree") == "true"
 
 
-def git_section(cwd):
-    if not is_git_repo(cwd):
-        return ["## Git", "", "Not a git repo.", ""]
-    if git(cwd, "rev-parse", "--verify", "-q", "HEAD"):
-        diffs = [["diff", "HEAD"]]
-    else:  # no commits yet, so there is no HEAD to compare with
-        diffs = [["diff", "--cached"], ["diff"]]
-    stat = "\n".join(filter(None, (git(cwd, *d, "--stat") for d in diffs))) or "(empty)"
-    diff = "\n".join(filter(None, (git(cwd, *d) for d in diffs))) or "(empty)"
-    if len(diff) > MAX_DIFF:
-        diff = diff[:MAX_DIFF] + f"\n...[{len(diff) - MAX_DIFF} chars cut, run git diff to see all]"
-    return ["## Git", "",
-            "### git status", "```", git(cwd, "status", "--short") or "(empty)", "```", "",
-            "### git diff --stat", "```", stat, "```", "",
-            "### recent commits", "```", git(cwd, "log", "--oneline", "-10") or "(none)", "```", "",
-            "### git diff (staged + unstaged)", "```diff", diff, "```", ""]
-
-
 def write_raw(cwd, old, new, ref, msgs):
     now = datetime.datetime.now()
     user_msgs = [text for role, text in msgs if role == "user"]
@@ -534,7 +516,6 @@ def write_raw(cwd, old, new, ref, msgs):
     for i, text in enumerate(user_msgs, 1):
         out += [f"### {i}", text.strip("\r\n"), ""]
     out += [f"## Last reply from {old}", "", replies[-1].strip() if replies else "(none)", ""]
-    out += git_section(cwd)
     labels = {"user": "**User:**", "assistant": f"**{old}:**", "tool": "`tool`", "result": "> result:"}
     out += ["## Full transcript", ""]
     for role, text in msgs:

@@ -43,7 +43,13 @@ When your agent hits its limit:
 
 To skip the wait and start right away: `handoff codex --go`
 
-**Tip: work in a git repo.** Git records every file change, even the ones you or a script made, so the new agent sees exactly what changed. Without git, it only has the old chat to go on. No git yet? Run `git init` in your project folder.
+**Tip: work in a git repo.** Git records every file change, even the ones you or a script made, so the new agent can check exactly what changed. Without git, it only has the old chat to go on. No git yet? Run `git init` in your project folder.
+
+> [!WARNING]
+> **Use one agent at a time in a folder.** If two agents work in the same folder at once (say Claude on the frontend and Codex on the backend):
+> - handoff takes the newest session, which may be the wrong one. Pick it yourself with `--from`, for example `handoff opencode --from claude`.
+> - the new agent sees both agents' changes mixed together in git
+> - both share one `HANDOFF.md`, so one task's notes can replace the other's
 
 ## Example
 
@@ -76,10 +82,9 @@ Codex hits its limit too? Run `handoff opencode`. OpenCode gets the work from bo
 2. Saves a file in `.handoff/` with:
    - your messages, word for word
    - the old agent's last reply
-   - `git status` and the full `git diff HEAD` (staged + unstaged changes)
    - the full chat
 3. Starts the new agent, which waits for you to pick a model and type `go`.
-4. The agent reads that file, writes a summary in `.handoff/HANDOFF.md`, and continues.
+4. The agent reads that file, checks the code changes with git (in a git repo), writes a summary in `.handoff/HANDOFF.md`, and continues.
 
 Your exact messages are saved as-is, so rules like "don't touch the database code" are never lost, even if the summary misses them.
 

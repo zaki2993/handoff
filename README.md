@@ -10,7 +10,7 @@ Works on Linux with:
 
 ## Install
 
-You need Python 3 and git. No other dependencies.
+You need Python 3. Git is recommended (see the tip below). No other dependencies.
 
 ```
 git clone https://github.com/zaki2993/handoff.git ~/handoff

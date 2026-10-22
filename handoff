@@ -29,8 +29,8 @@ MAX_DIFF = 200_000  # chars of git diff kept in the handoff file
 
 PROMPT = """You are taking over a coding session from {old}, another AI agent that hit its usage limit. Do not lose anything important.
 
-1. Read {raw}. It has the user's messages word for word, the git changes (if any), and the full transcript of the last session.
-2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches.
+1. Read {raw}. It has the user's messages word for word, the git changes (if any), and the full transcript of the last session. If it is long, read the top and the end of the transcript first: the end shows where the work stopped.
+2. If .handoff/HANDOFF.md exists, read it too. It has notes from earlier switches, but it may be about an older, different task. Keep only what still matters for the current task.
 3. {git_step}
 4. Write .handoff/HANDOFF.md with these sections: Goal, Done, Left to do, Decisions and why, Things that failed, User rules and preferences, Key files. If it already exists, update it and keep the important notes from earlier switches. If important files are in /tmp, say so in Key files, since /tmp is deleted on reboot.
 5. Tell the user in 2-3 lines where the work stands, then continue the task from where it stopped."""
@@ -158,8 +158,75 @@ def codex_load(path):
         elif t in ("function_call", "custom_tool_call"):
             msgs.append(("tool", f'{p.get("name")} {short(p.get("arguments") or p.get("input") or "")}'))
         elif t in ("function_call_output", "custom_tool_call_output"):
-            msgs.append(("result", short(p.get("output", ""))))
+            out = codex_output(p.get("output", ""))
+            if out.strip():
+                msgs.append(("result", short(out)))
     return msgs
+
+
+def codex_output(out):
+    """Pull the real text out of a Codex tool output.
+
+    Outputs are a string, or a list of parts like {"type": "input_text", "text": ...}.
+    Command results inside a part are JSON: {"output": ..., "exit_code": ...}.
+    """
+    parts = out if isinstance(out, list) else [{"type": "input_text", "text": out}]
+    texts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") != "input_text":
+            texts.append(f"[{part.get('type')}]")  # e.g. an image
+            continue
+        text = str(part.get("text", ""))
+        if re.fullmatch(r"Script completed\nWall time [\d.]+ seconds\nOutput:\n?", text):
+            continue  # wrapper line, says nothing
+        d = parse_json(text)
+        if d is not None:
+            found = json_outputs(d)
+            if found or not d:
+                texts += found
+                continue
+        else:
+            # JSON lines after a "Warning: truncated output" header; lines cut by Codex stay as they are
+            lines = []
+            for line in text.split("\n"):
+                d = parse_json(line)
+                found = json_outputs(d) if d is not None else []
+                lines += found or [line]
+            text = "\n".join(lines)
+        texts.append(text)
+    return "\n".join(texts)
+
+
+def parse_json(text):
+    """Return parsed JSON if text is a JSON object or list, else None."""
+    if not text.lstrip().startswith(("{", "[")):
+        return None
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return None
+    return d if isinstance(d, (dict, list)) else None
+
+
+def json_outputs(d):
+    """Find command results ({"output": ..., "exit_code": ...}) anywhere in Codex JSON.
+
+    Parallel commands are nested like [{"status": "fulfilled", "value": {"output": ...}}].
+    """
+    if isinstance(d, dict):
+        if isinstance(d.get("output"), str):
+            code = d.get("exit_code")
+            return [f"(exit code {code})\n{d['output']}" if code else d["output"]]
+        if d.get("status") == "rejected":
+            return [f"(failed) {d.get('reason')}"]
+        if d.get("status") == "fulfilled" and isinstance(d.get("value"), str):
+            return [d["value"]]
+        return [x for v in d.values() for x in json_outputs(v)]
+    if isinstance(d, list):
+        return [x for v in d for x in json_outputs(v)]
+    return []
 
 
 # ---------- OpenCode: ~/.local/share/opencode/opencode*.db (SQLite) ----------
@@ -193,6 +260,8 @@ def opencode_sessions(cwd):
 def opencode_tool(name, state):
     msgs = [("tool", f"{name} {short(json.dumps(state.get('input', {})))}")]
     out = state.get("output") or state.get("error") or state.get("content") or ""
+    if isinstance(out, dict):  # errors look like {"type": "aborted", "message": "..."}
+        out = out.get("message") or json.dumps(out)
     if isinstance(out, list):
         out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
     if out:
@@ -352,7 +421,10 @@ def find_session(cwd, agents):
 
 
 def git(cwd, *args):
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError:  # git is not installed
+        return None
     return r.stdout.rstrip() if r.returncode == 0 else None
 
 

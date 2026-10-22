@@ -225,7 +225,11 @@ def json_outputs(d):
             return [d["value"]]
         return [x for v in d.values() for x in json_outputs(v)]
     if isinstance(d, list):
-        return [x for v in d for x in json_outputs(v)]
+        found = [json_outputs(v) for v in d]
+        if not any(found):
+            return []
+        # keep items without an output (like errors) as they are
+        return [x for v, f in zip(d, found) for x in (f or ([json.dumps(v)] if v else []))]
     return []
 
 
@@ -235,12 +239,14 @@ OPENCODE_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") /
 
 
 def opencode_dbs():
-    # opencode.db, plus opencode-<channel>.db, plus OPENCODE_DB (relative to the data folder)
-    dbs = sorted(OPENCODE_DATA.glob("opencode*.db"))
+    # OPENCODE_DB (relative to the data folder) replaces the default ones,
+    # else opencode.db plus opencode-<channel>.db
     custom = os.environ.get("OPENCODE_DB")
     if custom and custom != ":memory:":
-        dbs.append(OPENCODE_DATA / custom)
-    return [db for db in dict.fromkeys(dbs) if db.exists()]
+        dbs = [OPENCODE_DATA / custom]
+    else:
+        dbs = sorted(OPENCODE_DATA.glob("opencode*.db"))
+    return [db for db in dbs if db.exists()]
 
 
 def opencode_sessions(cwd):
@@ -422,7 +428,7 @@ def find_session(cwd, agents):
 
 def git(cwd, *args):
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, errors="replace")
     except FileNotFoundError:  # git is not installed
         return None
     return r.stdout.rstrip() if r.returncode == 0 else None
@@ -436,7 +442,7 @@ def write_raw(cwd, old, new, ref, msgs):
            f"- Time: {now:%Y-%m-%d %H:%M}", f"- Project: {cwd}", f"- Old session: {ref}", "",
            "## User messages (word for word)", ""]
     for i, text in enumerate(user_msgs, 1):
-        out += [f"### {i}", text.strip(), ""]
+        out += [f"### {i}", text.strip("\r\n"), ""]
     out += [f"## Last reply from {old}", "", replies[-1].strip() if replies else "(none)", ""]
 
     out += ["## Git", ""]
@@ -459,7 +465,7 @@ def write_raw(cwd, old, new, ref, msgs):
     labels = {"user": "**User:**", "assistant": f"**{old}:**", "tool": "`tool`", "result": "> result:"}
     out += ["## Full transcript", ""]
     for role, text in msgs:
-        out += [f"{labels[role]} {text.strip()}", ""]
+        out += [labels[role] + " " + text.strip("\r\n"), ""]
 
     folder = Path(cwd) / ".handoff"
     folder.mkdir(exist_ok=True)

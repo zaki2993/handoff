@@ -5,7 +5,7 @@ Reads the last session of the old agent from disk, saves the raw facts
 (your messages and the full transcript) in .handoff/, then starts
 the new agent and asks it to write the summary in .handoff/HANDOFF.md.
 
-Usage: handoff <claude|codex|opencode|agy|pi> [--from AGENT] [--no-launch] [--go]
+Usage: handoff <claude|codex|opencode|agy|pi|cmd> [--from AGENT] [--no-launch] [--go]
        handoff --clean
 """
 import argparse
@@ -32,7 +32,7 @@ AGY_DIR = HOME / ".gemini/antigravity-cli"
 PI_SESSIONS = Path(os.environ.get("PI_CODING_AGENT_SESSION_DIR")
                    or Path(os.environ.get("PI_CODING_AGENT_DIR") or HOME / ".pi/agent") / "sessions")
 
-ALIASES = {"antigravity": "agy", "claude-code": "claude"}
+ALIASES = {"antigravity": "agy", "claude-code": "claude", "command-code": "cmd", "commandcode": "cmd"}
 MAX_OUT = 2000  # chars of each tool call / tool output kept in the transcript
 FOLDER = ".handoff"
 
@@ -437,20 +437,26 @@ def pi_sessions(cwd):
             continue
 
 
-def pi_load(path):
+def last_branch(path):
+    """Entries of the current branch, oldest first.
+
+    A session can be a tree (you go back and branch), so walk from the
+    last entry back to the start through parentId.
+    """
     entries = [e for e in read_jsonl(path) if e.get("id")]
     by_id = {e["id"]: e for e in entries}
-    # a session is a tree (you can go back and branch with /tree), so walk the
-    # current branch: from the last entry back to the start through parentId
     branch, seen = [], set()
     e = entries[-1] if entries else None
     while e and e["id"] not in seen:
         seen.add(e["id"])
         branch.append(e)
         e = by_id.get(e.get("parentId"))
+    return branch[::-1]
 
+
+def pi_load(path):
     msgs = []
-    for e in reversed(branch):
+    for e in last_branch(path):  # pi branches with /tree
         if e.get("type") == "branch_summary":
             msgs.append(("assistant", "(summary of a branch the user left) " + str(e.get("summary", ""))))
         if e.get("type") != "message":
@@ -475,6 +481,42 @@ def pi_load(path):
     return msgs
 
 
+# Command Code: ~/.commandcode/projects/<cwd with - >/<id>.jsonl
+
+def cmd_sessions(cwd):
+    for f in (HOME / ".commandcode/projects").glob("*/*.jsonl"):
+        try:
+            head = first_json(f)  # skips <id>.checkpoints.jsonl, its first line has no type
+            if head.get("type") == "session" and head.get("cwd") == cwd:
+                yield f.stat().st_mtime, str(f), partial(cmd_load, f)
+        except (OSError, ValueError):
+            continue
+
+
+def cmd_load(path):
+    msgs = []
+    for e in last_branch(path):
+        if e.get("type") != "message":
+            continue
+        m = e.get("message") or {}
+        role, content = m.get("role"), m.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if role not in ("user", "assistant"):
+            continue
+        for c in content or []:
+            t = c.get("type")
+            if t == "text" and c.get("text") and not c["text"].lstrip().startswith("<system-reminder"):
+                msgs.append((role, c["text"]))
+            elif t == "tool_use":
+                msgs.append(("tool", f'{c.get("name")} {short(json.dumps(c.get("input")))}'))
+            elif t == "tool_result":
+                out = parts_text(c.get("content") or "")
+                if out:
+                    msgs.append(("result", short(("(error) " if c.get("is_error") else "") + out)))
+    return msgs
+
+
 # ---------- all agents ----------
 
 Agent = namedtuple("Agent", "sessions launch")
@@ -484,6 +526,7 @@ AGENTS = {
     "opencode": Agent(opencode_sessions, lambda p: ["opencode", "--prompt", p]),
     "agy": Agent(agy_sessions, lambda p: ["agy", "-i", p]),
     "pi": Agent(pi_sessions, lambda p: ["pi", p]),
+    "cmd": Agent(cmd_sessions, lambda p: ["cmd", p]),
 }
 
 

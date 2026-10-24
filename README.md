@@ -8,6 +8,7 @@ Works on Linux with:
 - OpenCode (`opencode`)
 - Antigravity CLI (`agy`)
 - pi (`pi`)
+- Command Code (`cmd`)
 
 ## Install
 
@@ -37,7 +38,7 @@ When your agent hits its limit:
    ```
    handoff codex
    ```
-   You can use `claude`, `codex`, `opencode`, `agy` or `pi`. You don't need to say which agent you're coming from, handoff finds it.
+   You can use `claude`, `codex`, `opencode`, `agy`, `pi` or `cmd`. You don't need to say which agent you're coming from, handoff finds it.
 3. The new agent opens and waits. If you want a different model, pick it with `/model`.
 4. Type `go`. The agent reads what the old one did and continues the work.
 
